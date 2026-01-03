@@ -1,0 +1,29 @@
+{
+  "http_port": 8080,
+  "primary_smtp": {
+    "server": "smtp.exmail.com",
+    "port": 465,
+    "email": "alert@yourdomain.com",
+    "password": "your_smtp_password",
+    "skip_verify": false
+  },
+  "backup_smtp": {
+    "server": "smtp.gmail.com",
+    "port": 587,
+    "email": "backup_alert@gmail.com",
+    "password": "your_gmail_app_password",
+    "skip_verify": true
+  },
+  "recipient_groups": {
+    "devops": [
+      "admin@yourdomain.com",
+      "oncall@yourdomain.com"
+    ],
+    "billing": [
+      "finance@yourdomain.com"
+    ]
+  },
+  "rate_limit_interval": 1,
+  "queue_capacity": 2000,
+  "worker_count": 5
+}
