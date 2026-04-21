@@ -7,32 +7,31 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
-	"mime" // [修复] 处理邮件头编码
-	"net"
 	"net/http"
-	"net/smtp"
+	"net/mail"
 	"os"
 	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
-)
 
-// --- 常量定义 ---
+	"github.com/go-chi/chi/v5"
+	gomail "github.com/wneessen/go-mail"
+	gomailsmtp "github.com/wneessen/go-mail/smtp"
+	"go.uber.org/zap"
+)
 
 const (
-	MaxHeaderLength = 1024       // 限制单个 Header 长度
-	MaxBodyLength   = 1024 * 512 // 限制邮件正文 512KB
+	MaxHeaderLength = 1024
+	MaxBodyLength   = 1024 * 512
 	PidFileName     = "/tmp/gomail-api.pid"
-	SMTPTimeout     = 30 * time.Second // SMTP 交互硬超时
+	SMTPTimeout     = 30 * time.Second
 )
-
-// --- 数据结构 ---
 
 type SMTPConfig struct {
 	Server     string `json:"server"`
@@ -53,11 +52,10 @@ type Config struct {
 }
 
 type EmailTask struct {
-	TargetGroup string
-	Recipients  []string
-	Subject     string
-	Content     string
-	ReceivedAt  time.Time
+	TargetGroup    string
+	RecipientAddrs []*mail.Address
+	Subject        string
+	Content        string
 }
 
 type StatusResponse struct {
@@ -79,51 +77,45 @@ type SystemStats struct {
 	PID        int `json:"pid"`
 }
 
-type atomicConfig struct {
-	sync.RWMutex
-	cfg *Config
+type App struct {
+	cfg        atomic.Pointer[runtimeConfig]
+	queue      chan EmailTask
+	startTime  time.Time
+	logger     *zap.Logger
+	configPath string
+	wg         sync.WaitGroup
 }
 
-func (ac *atomicConfig) Get() *Config {
-	ac.RLock()
-	defer ac.RUnlock()
-	return ac.cfg
+type recipientGroup struct {
+	parsed []*mail.Address
 }
 
-func (ac *atomicConfig) Set(c *Config) {
-	ac.Lock()
-	defer ac.Unlock()
-	ac.cfg = c
+type runtimeConfig struct {
+	raw       *Config
+	groups    map[string]recipientGroup
+	rateLimit time.Duration
 }
 
-// --- 全局变量 ---
-
-var (
-	globalConfig atomicConfig
-	taskQueue    chan EmailTask
-	startTime    time.Time
-	wg           sync.WaitGroup
-	logger       *slog.Logger
-	Version      = "dev" // 编译时注入
-)
-
-// --- 初始化与入口 ---
-
-func init() {
-	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
+type smtpSender struct {
+	client *gomail.Client
+	conn   *gomailsmtp.Client
+	from   string
 }
+
+type workerSenders struct {
+	cfg     *runtimeConfig
+	logger  *zap.Logger
+	primary *smtpSender
+	backup  *smtpSender
+}
+
+var Version = "dev"
 
 func main() {
-	startTime = time.Now()
-
 	configPath := flag.String("config", "config.json", "配置文件路径")
 	checkMode := flag.Bool("check", false, "验证配置并测试连接")
 	reloadMode := flag.Bool("reload", false, "向运行中的服务发送重载信号")
 	versionMode := flag.Bool("version", false, "查看版本")
-
 	flag.Parse()
 
 	if *versionMode {
@@ -142,7 +134,7 @@ func main() {
 
 	cfg, err := loadAndValidateConfig(*configPath)
 	if err != nil {
-		logger.Error("Failed to load config", "error", err)
+		fmt.Fprintf(os.Stderr, "配置加载失败: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -151,48 +143,72 @@ func main() {
 		return
 	}
 
-	startServer(cfg, *configPath)
+	app := newApp(cfg, *configPath)
+	if err := app.run(); err != nil {
+		app.logger.Fatal("server exited with error", zap.Error(err))
+	}
 }
 
-// --- 服务逻辑 ---
-
-func startServer(cfg *Config, configPath string) {
-	currentPID := os.Getpid()
-	if err := os.WriteFile(PidFileName, []byte(strconv.Itoa(currentPID)), 0644); err != nil {
-		logger.Error("Failed to write PID", "error", err)
-		os.Exit(1)
+func newApp(cfg *runtimeConfig, configPath string) *App {
+	loggerCfg := zap.NewProductionConfig()
+	loggerCfg.OutputPaths = []string{"stdout"}
+	loggerCfg.ErrorOutputPaths = []string{"stderr"}
+	logger, err := loggerCfg.Build()
+	if err != nil {
+		panic(err)
 	}
-	defer os.Remove(PidFileName)
 
-	globalConfig.Set(cfg)
-
-	qCap := cfg.QueueCapacity
+	qCap := cfg.raw.QueueCapacity
 	if qCap <= 0 {
 		qCap = 1000
 	}
-	taskQueue = make(chan EmailTask, qCap)
 
-	workerNum := cfg.WorkerCount
+	app := &App{
+		queue:      make(chan EmailTask, qCap),
+		startTime:  time.Now(),
+		logger:     logger,
+		configPath: configPath,
+	}
+	app.cfg.Store(cfg)
+	return app
+}
+
+func (a *App) run() error {
+	defer a.logger.Sync()
+
+	currentPID := os.Getpid()
+	if err := os.WriteFile(PidFileName, []byte(strconv.Itoa(currentPID)), 0644); err != nil {
+		return fmt.Errorf("write PID file: %w", err)
+	}
+	defer os.Remove(PidFileName)
+
+	cfg := a.cfg.Load()
+	workerNum := cfg.raw.WorkerCount
 	if workerNum <= 0 {
 		workerNum = runtime.NumCPU() * 2
 	}
 
-	// [新增] 端口处理逻辑
-	port := cfg.HTTPPort
+	port := cfg.raw.HTTPPort
 	if port <= 0 {
 		port = 8080
 	}
 
-	logger.Info("Starting GoMail API", "version", Version, "workers", workerNum, "pid", currentPID, "port", port)
+	a.logger.Info("starting gomail api",
+		zap.String("version", Version),
+		zap.Int("workers", workerNum),
+		zap.Int("pid", currentPID),
+		zap.Int("port", port),
+		zap.Int("queue_capacity", cap(a.queue)),
+	)
 
 	for i := 0; i < workerNum; i++ {
-		wg.Add(1)
-		go emailWorker(i)
+		a.wg.Add(1)
+		go a.emailWorker(i)
 	}
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", port), // [修改] 使用配置端口
-		Handler:      http.HandlerFunc(routeHandler),
+		Addr:         fmt.Sprintf(":%d", port),
+		Handler:      a.routes(),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
@@ -200,50 +216,83 @@ func startServer(cfg *Config, configPath string) {
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
+	errChan := make(chan error, 1)
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("HTTP server failed", "error", err)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errChan <- err
 		}
+		close(errChan)
 	}()
 
+	cleanupWorkers := func() {
+		close(a.queue)
+		a.wg.Wait()
+	}
+
 	for {
-		sig := <-stopChan
-		if sig == syscall.SIGHUP {
-			logger.Info("Reloading config...")
-			if nCfg, err := loadAndValidateConfig(configPath); err == nil {
-				globalConfig.Set(nCfg)
-				logger.Info("Config reloaded")
-			} else {
-				logger.Error("Reload failed", "error", err)
+		select {
+		case err := <-errChan:
+			cleanupWorkers()
+			return err
+		case sig := <-stopChan:
+			switch sig {
+			case syscall.SIGHUP:
+				a.reloadConfig()
+			default:
+				a.logger.Info("shutting down", zap.String("signal", sig.String()))
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				shutdownErr := server.Shutdown(ctx)
+				cancel()
+				cleanupWorkers()
+				return shutdownErr
 			}
-		} else {
-			logger.Info("Shutting down...", "signal", sig)
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			server.Shutdown(ctx)
-			cancel()
-			close(taskQueue)
-			wg.Wait()
-			return
 		}
 	}
 }
 
-// --- 业务逻辑 ---
+func (a *App) routes() http.Handler {
+	r := chi.NewRouter()
 
-func routeHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/healthz" {
-		w.Write([]byte("ok"))
-		return
-	}
-	if r.URL.Path == "/status" && r.Method == http.MethodGet {
-		handleStatus(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
+	r.HandleFunc("/healthz", a.handleHealthz)
+	r.Get("/status", a.handleStatus)
+	r.Post("/", a.handleSendMail)
+	r.Post("/*", a.handleSendMail)
+
+	r.MethodNotAllowed(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+	})
+	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	})
 
+	return r
+}
+
+func (a *App) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (a *App) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	qLen, qCap := len(a.queue), cap(a.queue)
+	resp := StatusResponse{
+		Status:    "ok",
+		Uptime:    time.Since(a.startTime).String(),
+		BuildInfo: Version,
+		Queue: QueueStats{
+			Current:  qLen,
+			Capacity: qCap,
+			Usage:    fmt.Sprintf("%.1f%%", float64(qLen)/float64(qCap)*100),
+		},
+		System: SystemStats{
+			Goroutines: runtime.NumGoroutine(),
+			PID:        os.Getpid(),
+		},
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (a *App) handleSendMail(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, int64(MaxBodyLength))
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "Request too large or invalid", http.StatusBadRequest)
@@ -258,176 +307,262 @@ func routeHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing params", http.StatusBadRequest)
 		return
 	}
-
 	if len(subject) > MaxHeaderLength || len(target) > MaxHeaderLength {
 		http.Error(w, "Parameter too long", http.StatusBadRequest)
 		return
 	}
 
-	cfg := globalConfig.Get()
-	rcpts, ok := cfg.RecipientGroups[target]
-	if !ok || len(rcpts) == 0 {
+	cfg := a.cfg.Load()
+	if cfg == nil {
+		http.Error(w, "Service not ready", http.StatusServiceUnavailable)
+		return
+	}
+	group, ok := cfg.groups[target]
+	if !ok || len(group.parsed) == 0 {
 		http.Error(w, "Group not found or empty", http.StatusNotFound)
 		return
 	}
 
 	task := EmailTask{
-		TargetGroup: target,
-		Recipients:  rcpts,
-		Subject:     sanitizeHeader(subject),
-		Content:     content,
-		ReceivedAt:  time.Now(),
+		TargetGroup:    target,
+		RecipientAddrs: group.parsed,
+		Subject:        sanitizeHeader(subject),
+		Content:        content,
 	}
 
 	select {
-	case taskQueue <- task:
+	case a.queue <- task:
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "queued")
+		_, _ = w.Write([]byte("queued"))
 	default:
 		http.Error(w, "Queue full", http.StatusServiceUnavailable)
 	}
 }
 
-func emailWorker(id int) {
-	defer wg.Done()
+func (a *App) emailWorker(id int) {
+	defer a.wg.Done()
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("Worker panicked", "id", id, "panic", r)
+			a.logger.Error("worker panicked", zap.Int("id", id), zap.Any("panic", r))
 		}
 	}()
 
-	for task := range taskQueue {
-		cfg := globalConfig.Get()
-		if cfg.RateLimitInterval > 0 {
-			time.Sleep(time.Duration(cfg.RateLimitInterval) * time.Second)
+	var senders *workerSenders
+	var nextSendAt time.Time
+	defer func() {
+		if senders != nil {
+			senders.close()
+		}
+	}()
+
+	for task := range a.queue {
+		cfg := a.cfg.Load()
+		if cfg == nil {
+			a.logger.Error("config not ready", zap.Int("worker", id))
+			continue
+		}
+
+		if senders == nil || senders.cfg != cfg {
+			if senders != nil {
+				senders.close()
+			}
+			var err error
+			senders, err = newWorkerSenders(cfg, a.logger)
+			if err != nil {
+				a.logger.Error("initialize SMTP sender failed", zap.Int("worker", id), zap.Error(err))
+				continue
+			}
+			nextSendAt = time.Time{}
+		}
+
+		if cfg.rateLimit > 0 {
+			now := time.Now()
+			if wait := time.Until(nextSendAt); wait > 0 {
+				time.Sleep(wait)
+				now = time.Now()
+			}
+			nextSendAt = now.Add(cfg.rateLimit)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		err := executeSendMail(ctx, cfg, task)
+		err := senders.send(ctx, task)
 		cancel()
 
-		// [修改] 在日志中增加 subject 和 content 字段
 		if err != nil {
-			logger.Error("Send failed", "group", task.TargetGroup, "error", err, "subject", task.Subject, "content", task.Content)
+			a.logger.Error("send failed",
+				zap.Int("worker", id),
+				zap.String("group", task.TargetGroup),
+				zap.String("subject", task.Subject),
+				zap.Error(err),
+			)
 		} else {
-			logger.Info("Send success", "group", task.TargetGroup, "subject", task.Subject, "content", task.Content)
+			a.logger.Info("send success",
+				zap.Int("worker", id),
+				zap.String("group", task.TargetGroup),
+				zap.String("subject", task.Subject),
+			)
 		}
 	}
 }
 
-func executeSendMail(ctx context.Context, cfg *Config, task EmailTask) error {
-	err := sendOne(ctx, cfg.PrimarySMTP, task.Recipients, task.Subject, task.Content)
-	if err != nil && cfg.BackupSMTP != nil {
-		logger.Warn("Backup trial", "error", err)
-		return sendOne(ctx, *cfg.BackupSMTP, task.Recipients, task.Subject, task.Content)
+func newWorkerSenders(cfg *runtimeConfig, logger *zap.Logger) (*workerSenders, error) {
+	primary, err := newSMTPSender(cfg.raw.PrimarySMTP)
+	if err != nil {
+		return nil, fmt.Errorf("create primary smtp sender: %w", err)
+	}
+
+	ws := &workerSenders{
+		cfg:     cfg,
+		logger:  logger,
+		primary: primary,
+	}
+
+	if cfg.raw.BackupSMTP != nil {
+		backup, err := newSMTPSender(*cfg.raw.BackupSMTP)
+		if err != nil {
+			primary.close()
+			return nil, fmt.Errorf("create backup smtp sender: %w", err)
+		}
+		ws.backup = backup
+	}
+
+	return ws, nil
+}
+
+func (w *workerSenders) close() {
+	if w.primary != nil {
+		w.primary.close()
+	}
+	if w.backup != nil {
+		w.backup.close()
+	}
+}
+
+func (w *workerSenders) send(ctx context.Context, task EmailTask) error {
+	err := w.primary.send(ctx, task)
+	if err != nil && w.backup != nil {
+		w.logger.Warn("primary failed, trying backup", zap.Error(err), zap.String("group", task.TargetGroup))
+		return w.backup.send(ctx, task)
 	}
 	return err
 }
 
-func sendOne(ctx context.Context, sc SMTPConfig, rcpts []string, sub, body string) error {
-	addr := net.JoinHostPort(sc.Server, strconv.Itoa(sc.Port))
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-
-	var conn net.Conn
-	var err error
-
-	if sc.Port == 465 {
-		tlsConfig := &tls.Config{InsecureSkipVerify: sc.SkipVerify, ServerName: sc.Server}
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
-	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", addr)
+func newSMTPSender(sc SMTPConfig) (*smtpSender, error) {
+	tlsCfg := &tls.Config{InsecureSkipVerify: sc.SkipVerify, ServerName: sc.Server}
+	opts := []gomail.Option{
+		gomail.WithPort(sc.Port),
+		gomail.WithTimeout(SMTPTimeout),
+		gomail.WithTLSConfig(tlsCfg),
 	}
-	if err != nil {
-		return err
-	}
-	// [修复] 确保连接最终被关闭。如果 smtp.NewClient 成功，它会管理连接并在 c.Quit 时关闭。
-	// 这里通过 defer conn.Close 保证在所有中间错误路径下连接都能释放。
-	defer func() {
-		if conn != nil {
-			conn.Close()
-		}
-	}()
 
-	conn.SetDeadline(time.Now().Add(SMTPTimeout))
-
-	host, _, _ := net.SplitHostPort(addr)
-	c, err := smtp.NewClient(conn, host)
-	if err != nil {
-		return err
-	}
-	conn = nil // [修复] 将 conn 置空，避免 defer 重复操作（c.Quit 会关闭它）
-	defer c.Quit()
-
-	if sc.Port != 465 {
-		if ok, _ := c.Extension("STARTTLS"); ok {
-			tlsConfig := &tls.Config{InsecureSkipVerify: sc.SkipVerify, ServerName: sc.Server}
-			if err = c.StartTLS(tlsConfig); err != nil {
-				return err
-			}
-		} else if sc.Port == 587 {
-			// [修复] 强制加密安全性：587 端口如果不提供 STARTTLS 则拒绝继续，防止凭证明文外泄
-			return errors.New("STARTTLS required but not supported by server")
-		}
+	switch sc.Port {
+	case 465:
+		opts = append(opts, gomail.WithSSL())
+	case 587:
+		opts = append(opts, gomail.WithTLSPolicy(gomail.TLSMandatory))
+	default:
+		opts = append(opts, gomail.WithTLSPolicy(gomail.TLSOpportunistic))
 	}
 
 	if sc.Password != "" {
-		auth := smtp.PlainAuth("", sc.Email, sc.Password, sc.Server)
-		if err = c.Auth(auth); err != nil {
-			return err
-		}
+		opts = append(opts,
+			gomail.WithSMTPAuth(gomail.SMTPAuthPlain),
+			gomail.WithUsername(sc.Email),
+			gomail.WithPassword(sc.Password),
+		)
 	}
 
-	if err = c.Mail(sc.Email); err != nil {
-		return err
-	}
-	for _, r := range rcpts {
-		if err = c.Rcpt(r); err != nil {
-			return err
-		}
+	client, err := gomail.NewClient(sc.Server, opts...)
+	if err != nil {
+		return nil, err
 	}
 
-	w, err := c.Data()
+	return &smtpSender{client: client, from: sc.Email}, nil
+}
+
+func (s *smtpSender) send(ctx context.Context, task EmailTask) error {
+	msg, err := buildMessage(s.from, task)
 	if err != nil {
 		return err
 	}
-	msg := buildMessage(sc.Email, rcpts, sub, body)
-	if _, err = w.Write(msg); err != nil {
+
+	conn, err := s.ensureConn(ctx)
+	if err != nil {
 		return err
 	}
-	return w.Close()
+
+	if err := s.client.SendWithSMTPClient(conn, msg); err != nil {
+		_ = s.client.CloseWithSMTPClient(conn)
+		s.conn = nil
+		return err
+	}
+	return nil
 }
 
-// [修复] buildMessage: 解决 RFC 2047 标题编码和 RFC 5321 换行符问题
-func buildMessage(from string, rcpts []string, sub, body string) []byte {
-	domain := "localhost"
-	if parts := strings.Split(from, "@"); len(parts) > 1 {
-		domain = parts[1]
+func (s *smtpSender) ensureConn(ctx context.Context) (*gomailsmtp.Client, error) {
+	if s.conn != nil && s.conn.HasConnection() {
+		return s.conn, nil
 	}
-	msgID := fmt.Sprintf("<%d.%d@%s>", time.Now().UnixNano(), os.Getpid(), domain)
+	conn, err := s.client.DialToSMTPClientWithContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.conn = conn
+	return s.conn, nil
+}
 
-	displayTo := strings.Join(rcpts, ",")
-	if len(displayTo) > 900 {
-		displayTo = fmt.Sprintf("%s... (%d recipients)", rcpts[0], len(rcpts))
+func (s *smtpSender) close() {
+	if s.conn == nil {
+		return
+	}
+	_ = s.client.CloseWithSMTPClient(s.conn)
+	s.conn = nil
+}
+
+func buildMessage(from string, task EmailTask) (*gomail.Msg, error) {
+	msg := gomail.NewMsg()
+	if err := msg.From(from); err != nil {
+		return nil, err
+	}
+	msg.ToMailAddress(task.RecipientAddrs...)
+	msg.Subject(task.Subject)
+	msg.SetBodyString(gomail.TypeTextPlain, normalizeBody(task.Content))
+	return msg, nil
+}
+
+func normalizeBody(body string) string {
+	if body == "" {
+		return body
 	}
 
-	// [修复] 使用 Q-Encoding 编码 Subject，支持非 ASCII 字符并防止 Header 注入
-	encodedSub := mime.QEncoding.Encode("utf-8", sub)
-
-	headers := []string{
-		fmt.Sprintf("From: %s", from),
-		fmt.Sprintf("To: %s", displayTo),
-		fmt.Sprintf("Subject: %s", encodedSub),
-		fmt.Sprintf("Date: %s", time.Now().Format(time.RFC1123Z)),
-		fmt.Sprintf("Message-ID: %s", msgID),
-		"MIME-Version: 1.0",
-		"Content-Type: text/plain; charset=UTF-8",
+	needsNormalize := false
+	for i := 0; i < len(body); i++ {
+		if body[i] == '\n' || body[i] == '\r' {
+			needsNormalize = true
+			break
+		}
+	}
+	if !needsNormalize {
+		return body
 	}
 
-	// [修复] 换行符标准化：SMTP 协议正文必须使用 CRLF
-	body = strings.ReplaceAll(body, "\r\n", "\n") // 先统一为 LF
-	body = strings.ReplaceAll(body, "\n", "\r\n") // 再统一转为 CRLF
+	var b strings.Builder
+	b.Grow(len(body) + strings.Count(body, "\n"))
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '\r':
+			if i+1 < len(body) && body[i+1] == '\n' {
+				i++
+			}
+			b.WriteString("\r\n")
+		case '\n':
+			b.WriteString("\r\n")
+		default:
+			b.WriteByte(body[i])
+		}
+	}
 
-	return []byte(strings.Join(headers, "\r\n") + "\r\n\r\n" + body)
+	return b.String()
 }
 
 func sanitizeHeader(v string) string {
@@ -439,14 +574,26 @@ func sanitizeHeader(v string) string {
 	}, v)
 }
 
-// --- 其他辅助函数 ---
+func (a *App) reloadConfig() {
+	a.logger.Info("reloading config")
+	nCfg, err := loadAndValidateConfig(a.configPath)
+	if err != nil {
+		a.logger.Error("reload failed", zap.Error(err))
+		return
+	}
+	a.cfg.Store(nCfg)
+	a.logger.Info("config reloaded")
+}
 
 func performReload() error {
 	pidBytes, err := os.ReadFile(PidFileName)
 	if err != nil {
 		return err
 	}
-	pid, _ := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		return err
+	}
 	p, err := os.FindProcess(pid)
 	if err != nil {
 		return err
@@ -454,46 +601,106 @@ func performReload() error {
 	return p.Signal(syscall.SIGHUP)
 }
 
-func handleStatus(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	qLen, qCap := len(taskQueue), cap(taskQueue)
-	json.NewEncoder(w).Encode(StatusResponse{
-		Status: "ok",
-		Uptime: time.Since(startTime).String(),
-		Queue: QueueStats{
-			Current:  qLen,
-			Capacity: qCap,
-			Usage:    fmt.Sprintf("%.1f%%", float64(qLen)/float64(qCap)*100),
-		},
-		System: SystemStats{
-			Goroutines: runtime.NumGoroutine(),
-			PID:        os.Getpid(),
-		},
-	})
-}
-
-func loadAndValidateConfig(path string) (*Config, error) {
+func loadAndValidateConfig(path string) (*runtimeConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+
 	var cfg Config
 	if err := json.Unmarshal([]byte(os.ExpandEnv(string(data))), &cfg); err != nil {
 		return nil, err
 	}
-	if cfg.PrimarySMTP.Server == "" {
-		return nil, errors.New("missing server")
-	}
-	return &cfg, nil
+
+	return buildRuntimeConfig(&cfg)
 }
 
-func runDeepCheck(cfg *Config) {
-	addr := net.JoinHostPort(cfg.PrimarySMTP.Server, strconv.Itoa(cfg.PrimarySMTP.Port))
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+func buildRuntimeConfig(cfg *Config) (*runtimeConfig, error) {
+	if cfg.PrimarySMTP.Server == "" {
+		return nil, errors.New("missing primary_smtp.server")
+	}
+	if cfg.PrimarySMTP.Port <= 0 || cfg.PrimarySMTP.Port > 65535 {
+		return nil, errors.New("invalid primary_smtp.port")
+	}
+	if cfg.PrimarySMTP.Email == "" {
+		return nil, errors.New("missing primary_smtp.email")
+	}
+
+	if cfg.BackupSMTP != nil {
+		if cfg.BackupSMTP.Server == "" {
+			return nil, errors.New("missing backup_smtp.server")
+		}
+		if cfg.BackupSMTP.Port <= 0 || cfg.BackupSMTP.Port > 65535 {
+			return nil, errors.New("invalid backup_smtp.port")
+		}
+		if cfg.BackupSMTP.Email == "" {
+			return nil, errors.New("missing backup_smtp.email")
+		}
+	}
+
+	if len(cfg.RecipientGroups) == 0 {
+		return nil, errors.New("recipient_groups is empty")
+	}
+
+	groups := make(map[string]recipientGroup, len(cfg.RecipientGroups))
+	for name, recipients := range cfg.RecipientGroups {
+		if len(recipients) == 0 {
+			return nil, fmt.Errorf("recipient_groups.%s is empty", name)
+		}
+
+		parsed := make([]*mail.Address, 0, len(recipients))
+		for _, rcpt := range recipients {
+			addr := strings.TrimSpace(rcpt)
+			if addr == "" {
+				return nil, fmt.Errorf("recipient_groups.%s has empty address", name)
+			}
+
+			parsedAddr, err := mail.ParseAddress(addr)
+			if err != nil {
+				return nil, fmt.Errorf("recipient_groups.%s has invalid address %q: %w", name, addr, err)
+			}
+			parsed = append(parsed, parsedAddr)
+		}
+
+		groups[name] = recipientGroup{parsed: parsed}
+	}
+
+	return &runtimeConfig{
+		raw:       cfg,
+		groups:    groups,
+		rateLimit: time.Duration(cfg.RateLimitInterval) * time.Second,
+	}, nil
+}
+
+func runDeepCheck(cfg *runtimeConfig) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	primary, err := newSMTPSender(cfg.raw.PrimarySMTP)
 	if err != nil {
 		fmt.Printf("[FAIL] %v\n", err)
 		os.Exit(1)
 	}
-	conn.Close()
-	fmt.Println("[PASS] Connection successful")
+	defer primary.close()
+
+	if _, err := primary.ensureConn(ctx); err != nil {
+		fmt.Printf("[FAIL] %v\n", err)
+		os.Exit(1)
+	}
+
+	if cfg.raw.BackupSMTP != nil {
+		backup, err := newSMTPSender(*cfg.raw.BackupSMTP)
+		if err != nil {
+			fmt.Printf("[FAIL] backup setup: %v\n", err)
+			os.Exit(1)
+		}
+		defer backup.close()
+
+		if _, err := backup.ensureConn(ctx); err != nil {
+			fmt.Printf("[FAIL] backup connect: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	fmt.Println("[PASS] SMTP connection successful")
 }

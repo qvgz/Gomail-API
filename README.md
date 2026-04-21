@@ -2,7 +2,12 @@
 
 一个用 Go 语言编写的高性能、安全可靠的 SMTP 中继 API。
 
-特性：工作池、多 SMTP 故障转移、优雅关闭和符合 RFC 规范的头部生成。
+特性：工作池、多 SMTP 故障转移、优雅关闭、SMTP 长连接复用。
+
+核心实现：
+- HTTP 路由：`go-chi/chi`
+- 日志：`uber-go/zap`
+- SMTP 与邮件构造：`wneessen/go-mail`
 
 # 快速开始
 
