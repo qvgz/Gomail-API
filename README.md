@@ -58,7 +58,9 @@ gomail-api
 ## 接口
 
 POST / : 发送邮件
+
 GET /healthz : 存活探针
+
 GET /status : 服务内部状态监控
 
 # 注意事项
