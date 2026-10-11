@@ -241,9 +241,11 @@ func (a *App) sendWithRetry(parent context.Context, id int, task EmailTask, send
 		if err := parent.Err(); err != nil {
 			return err
 		}
-		ctx, cancel := context.WithTimeout(parent, SendTimeout)
-		err := send(ctx, task)
-		cancel()
+		err := func() error {
+			ctx, cancel := context.WithTimeout(parent, SendTimeout)
+			defer cancel()
+			return send(ctx, task)
+		}()
 		if err == nil || attempt == MaxSendRetries {
 			return err
 		}

@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
 	"net/url"
 	"strings"
 	"sync"
@@ -178,5 +181,107 @@ func TestWorkerDrainAndShutdownDeadline(t *testing.T) {
 				t.Fatal("worker remained in flight")
 			}
 		})
+	}
+}
+
+func TestConcurrentHTTPToSMTPDelivery(t *testing.T) {
+	const requests = 64
+	smtp := startTestSMTP(t, "normal")
+	// 模拟服务器记录命令的通道不应限制本次并发投递吞吐。
+	drainCtx, stopDrain := context.WithCancel(context.Background())
+	defer stopDrain()
+	go func() {
+		for {
+			select {
+			case <-smtp.commands:
+			case <-drainCtx.Done():
+				return
+			}
+		}
+	}()
+	cfg := validTestConfig()
+	cfg.PrimarySMTP = smtp.config
+	cfg.QueueCapacity = requests
+	cfg.WorkerCount = 4
+	runtime, err := buildRuntimeConfig(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := testApp(runtime)
+	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+	defer func() { app.stopQueue(); cancelWorkers(); app.wg.Wait() }()
+	for id := 0; id < cfg.WorkerCount; id++ {
+		app.wg.Add(1)
+		go app.emailWorker(workerCtx, id)
+	}
+	server := httptest.NewServer(app.routes())
+	defer server.Close()
+	client := server.Client()
+	client.Timeout = 3 * time.Second
+	failures := make(chan error, requests)
+	ids := make(chan string, requests)
+	var senders sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		senders.Add(1)
+		go func(worker int) {
+			defer senders.Done()
+			for index := worker; index < requests; index += 8 {
+				response, err := client.PostForm(server.URL+"/alerts/mail", url.Values{
+					"target_group": {"it"}, "subject": {fmt.Sprintf("message-%d", index)}, "content": {"mail body"},
+				})
+				if err != nil {
+					failures <- err
+					continue
+				}
+				body, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				if err != nil || response.StatusCode != http.StatusOK || string(body) != "queued" {
+					failures <- fmt.Errorf("request %d: status=%d error=%v", index, response.StatusCode, err)
+					continue
+				}
+				ids <- response.Header.Get("X-Message-ID")
+			}
+		}(worker)
+	}
+	senders.Wait()
+	client.CloseIdleConnections()
+	close(failures)
+	close(ids)
+	for err := range failures {
+		t.Error(err)
+	}
+	expected := make(map[string]bool, requests)
+	for id := range ids {
+		if id == "" || expected[id] {
+			t.Fatal("missing or repeated acknowledgment ID")
+		}
+		expected[id] = true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := app.shutdown(ctx, server.Config, cancelWorkers); err != nil {
+		t.Fatal(err)
+	}
+	if len(expected) != requests || app.metrics.accepted.Load() != requests || app.metrics.sent.Load() != requests || app.metrics.failed.Load() != 0 || app.metrics.inFlight.Load() != 0 {
+		t.Fatalf("acknowledged=%d accepted=%d sent=%d failed=%d in_flight=%d", len(expected), app.metrics.accepted.Load(), app.metrics.sent.Load(), app.metrics.failed.Load(), app.metrics.inFlight.Load())
+	}
+	for i := 0; i < requests; i++ {
+		select {
+		case data := <-smtp.messages:
+			message, err := mail.ReadMessage(strings.NewReader(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := strings.Trim(message.Header.Get("Message-ID"), "<>")
+			if !expected[id] {
+				t.Fatal("unexpected or duplicate SMTP message")
+			}
+			delete(expected, id)
+		default:
+			t.Fatal("acknowledged task was not delivered")
+		}
+	}
+	if len(expected) != 0 {
+		t.Fatal("some acknowledged tasks were lost")
 	}
 }

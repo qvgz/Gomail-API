@@ -23,6 +23,7 @@ type smtpSender struct {
 	from   string
 	config SMTPConfig
 	logger *zap.Logger
+	dial   gomail.DialContextFunc
 }
 
 type workerSenders struct {
@@ -68,10 +69,16 @@ func (w *workerSenders) close() {
 }
 
 func (w *workerSenders) send(ctx context.Context, task EmailTask) error {
-	err := w.primary.send(ctx, task)
+	// 给每个服务器独立的预算，主服务器不响应时仍给备用服务器留出时间。
+	send := func(sender *smtpSender) error {
+		attemptCtx, cancel := context.WithTimeout(ctx, SMTPTimeout)
+		defer cancel()
+		return sender.send(attemptCtx, task)
+	}
+	err := send(w.primary)
 	if err != nil && w.backup != nil && ctx.Err() == nil {
 		w.logger.Warn("primary failed, trying backup", zap.Error(err), zap.String("group", task.TargetGroup))
-		return w.backup.send(ctx, task)
+		return send(w.backup)
 	}
 	return err
 }
@@ -81,7 +88,10 @@ func newSMTPSender(sc SMTPConfig) (*smtpSender, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &smtpSender{client: client, from: sc.Email, config: sc, logger: zap.NewNop()}, nil
+	return &smtpSender{
+		client: client, from: sc.Email, config: sc, logger: zap.NewNop(),
+		dial: (&net.Dialer{}).DialContext,
+	}, nil
 }
 
 func smtpTLSConfig(sc SMTPConfig) *tls.Config {
@@ -178,7 +188,7 @@ func (s *smtpSender) ensureConn(ctx context.Context) (*gomailsmtp.Client, error)
 	var stop func()
 	client, err := newSMTPClient(s.config, func(dialCtx context.Context, network, _ string) (net.Conn, error) {
 		address := net.JoinHostPort(s.config.Server, fmt.Sprint(s.config.Port))
-		conn, err := (&net.Dialer{}).DialContext(dialCtx, network, address)
+		conn, err := s.dial(dialCtx, network, address)
 		if err != nil {
 			return nil, err
 		}

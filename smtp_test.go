@@ -3,15 +3,19 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"net/http/httptest"
 	"net/mail"
 	"net/textproto"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,6 +27,7 @@ type testSMTP struct {
 	commands  chan string
 	messages  chan string
 	closed    chan struct{}
+	auth      chan string
 }
 
 func startTestSMTP(t *testing.T, mode string) *testSMTP {
@@ -31,10 +36,20 @@ func startTestSMTP(t *testing.T, mode string) *testSMTP {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var tlsConfig *tls.Config
+	if mode == "implicit_tls" || mode == "starttls" {
+		seed := httptest.NewTLSServer(nil)
+		tlsConfig = seed.TLS.Clone()
+		seed.Close()
+		if mode == "implicit_tls" {
+			listener = tls.NewListener(listener, tlsConfig)
+		}
+	}
 	server := &testSMTP{
 		config:   SMTPConfig{Server: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port, Email: "robot@example.com"},
 		commands: make(chan string, 128), messages: make(chan string, 128),
 		closed: make(chan struct{}, 128),
+		auth:   make(chan string, 128),
 	}
 	var mu sync.Mutex
 	connections := make(map[net.Conn]bool)
@@ -53,7 +68,8 @@ func startTestSMTP(t *testing.T, mode string) *testSMTP {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				defer func() { conn.Close(); mu.Lock(); delete(connections, conn); mu.Unlock(); server.closed <- struct{}{} }()
+				raw := conn
+				defer func() { raw.Close(); mu.Lock(); delete(connections, raw); mu.Unlock(); server.closed <- struct{}{} }()
 				_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 				server.commands <- "connect"
 				reader := textproto.NewReader(bufio.NewReader(conn))
@@ -77,9 +93,20 @@ func startTestSMTP(t *testing.T, mode string) *testSMTP {
 						}
 						if mode == "reject_helo" {
 							fmt.Fprint(conn, "550 rejected\r\n")
+						} else if mode == "starttls" {
+							fmt.Fprint(conn, "250-test\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n")
+						} else if mode == "implicit_tls" {
+							fmt.Fprint(conn, "250-test\r\n250 AUTH PLAIN\r\n")
 						} else {
 							fmt.Fprint(conn, "250 test\r\n")
 						}
+					case "STARTTLS":
+						fmt.Fprint(conn, "220 ready for TLS\r\n")
+						conn = tls.Server(conn, tlsConfig)
+						reader = textproto.NewReader(bufio.NewReader(conn))
+					case "AUTH":
+						server.auth <- strings.Fields(line)[2]
+						fmt.Fprint(conn, "235 authenticated\r\n")
 					case "RCPT":
 						if mode == "reject_rcpt" {
 							fmt.Fprint(conn, "550 no such user\r\n")
@@ -252,5 +279,131 @@ func TestSMTPHandshakeFailureClosesTransport(t *testing.T) {
 	case <-server.closed:
 	case <-time.After(2 * time.Second):
 		t.Fatal("failed handshake leaked transport")
+	}
+}
+
+func TestSMTPTLSAndAuthentication(t *testing.T) {
+	for mode, port := range map[string]int{"implicit_tls": 465, "starttls": 587} {
+		t.Run(mode, func(t *testing.T) {
+			server := startTestSMTP(t, mode)
+			cfg := server.config
+			cfg.Port = port
+			cfg.Email = "告警机器人 <robot@example.com>"
+			cfg.Password = "test-smtp-password"
+			cfg.SkipVerify = true // 模拟内网 SMTP 的自签名证书。
+			sender, err := newSMTPSender(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sender.close()
+			sender.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(server.config.Server, fmt.Sprint(server.config.Port)))
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			for i := 0; i < 2; i++ {
+				if err := sender.send(ctx, testEmailTask()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if server.delivered.Load() != 2 {
+				t.Fatal("TLS messages were not delivered")
+			}
+			select {
+			case encoded := <-server.auth:
+				decoded, err := base64.StdEncoding.DecodeString(encoded)
+				if err != nil || string(decoded) != "\x00robot@example.com\x00test-smtp-password" {
+					t.Fatal("SMTP authentication did not use the parsed email address")
+				}
+			default:
+				t.Fatal("SMTP authentication was skipped")
+			}
+		})
+	}
+}
+
+// 使用内存连接和虚拟时间，验证失效长连接不会耗尽备用 SMTP 的发送预算。
+func TestSMTPStalledConnectionLeavesTimeForBackup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := SMTPConfig{Server: "smtp.example.com", Port: 25, Email: "robot@example.com"}
+		primary, err := newSMTPSender(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer primary.close()
+		backup, err := newSMTPSender(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer backup.close()
+		var primaryDials, backupDeliveries int
+		primary.dial = func(context.Context, string, string) (net.Conn, error) {
+			primaryDials++
+			client, server := net.Pipe()
+			if primaryDials == 1 {
+				go serveTestPipe(server, true, nil)
+			} else {
+				go func() { defer server.Close(); _, _ = server.Read(make([]byte, 1)) }()
+			}
+			return client, nil
+		}
+		backup.dial = func(context.Context, string, string) (net.Conn, error) {
+			client, server := net.Pipe()
+			go serveTestPipe(server, false, func() { backupDeliveries++ })
+			return client, nil
+		}
+		// 建立一条已经成功发送过邮件的连接，再模拟服务器挂起。
+		if err := primary.send(context.Background(), testEmailTask()); err != nil {
+			t.Fatal(err)
+		}
+		senders := &workerSenders{primary: primary, backup: backup, logger: zap.NewNop()}
+		ctx, cancel := context.WithTimeout(context.Background(), SendTimeout)
+		defer cancel()
+		started := time.Now()
+		if err := senders.send(ctx, testEmailTask()); err != nil {
+			t.Fatal(err)
+		}
+		if time.Since(started) != SMTPTimeout || backupDeliveries != 1 || primaryDials != 1 {
+			t.Fatalf("elapsed=%v backup=%d primary dials=%d", time.Since(started), backupDeliveries, primaryDials)
+		}
+	})
+}
+
+func serveTestPipe(conn net.Conn, stallAfterReset bool, onMessage func()) {
+	defer conn.Close()
+	fmt.Fprint(conn, "220 test SMTP\r\n")
+	reader := textproto.NewReader(bufio.NewReader(conn))
+	completed := false
+	for {
+		line, err := reader.ReadLine()
+		if err != nil {
+			return
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			return
+		}
+		switch fields[0] {
+		case "NOOP":
+			if completed && stallAfterReset {
+				_, _ = reader.ReadLine()
+				return
+			}
+			fmt.Fprint(conn, "250 OK\r\n")
+		case "DATA":
+			fmt.Fprint(conn, "354 send data\r\n")
+			if _, err := reader.ReadDotBytes(); err != nil {
+				return
+			}
+			if onMessage != nil {
+				onMessage()
+			}
+			fmt.Fprint(conn, "250 accepted\r\n")
+		case "RSET":
+			completed = true
+			fmt.Fprint(conn, "250 OK\r\n")
+		default:
+			fmt.Fprint(conn, "250 OK\r\n")
+		}
 	}
 }
