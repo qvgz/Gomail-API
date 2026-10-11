@@ -9,10 +9,10 @@
   },
   "backup_smtp": {
     "server": "smtp.gmail.com",
-    "port": 587,
+    "port": 465,
     "email": "backup_alert@gmail.com",
     "password": "your_gmail_app_password",
-    "skip_verify": true
+    "skip_verify": false
   },
   "recipient_groups": {
     "devops": [

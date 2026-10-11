@@ -1,0 +1,12 @@
+.git
+.agents
+.codex
+.aws
+config.json
+.env
+.env.*
+*.out
+*.test
+main
+gomail-api
+coverage.*
