@@ -1,19 +1,22 @@
-
 FROM --platform=$BUILDPLATFORM golang:1.27 AS builder
-ARG TARGETOS
-ARG TARGETARCH
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 ARG VERSION=dev
-WORKDIR /app
+WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+  go mod download
 COPY *.go ./
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+RUN --mount=type=cache,target=/go/pkg/mod \
+  --mount=type=cache,target=/root/.cache/go-build \
+  CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
   go build -trimpath -buildvcs=false \
   -ldflags="-s -w -buildid= -X main.Version=${VERSION}" \
-  -o gomail-api .
+  -o /out/gomail-api .
 
-FROM gcr.io/distroless/static-debian13:nonroot
+FROM gcr.io/distroless/static:nonroot
 WORKDIR /app
-COPY --from=builder /app/gomail-api /app/gomail-api
+COPY --from=builder /out/gomail-api /app/gomail-api
+USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/app/gomail-api"]

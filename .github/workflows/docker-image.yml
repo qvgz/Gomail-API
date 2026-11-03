@@ -12,8 +12,6 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v7
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v4
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v4
     - name: Login to DockerHub
@@ -39,7 +37,7 @@ jobs:
         context: .
         file: ./Dockerfile
         push: true
-        platforms: linux/amd64,linux/arm64
+        platforms: linux/amd64
         build-args: |
           VERSION=${{ steps.meta.outputs.build_version }}
         tags: ${{ steps.meta.outputs.build_tags }}

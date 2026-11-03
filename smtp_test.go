@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http/httptest"
 	"net/mail"
@@ -17,8 +18,6 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
-
-	"go.uber.org/zap"
 )
 
 type testSMTP struct {
@@ -151,9 +150,19 @@ func startTestSMTP(t *testing.T, mode string) *testSMTP {
 	return server
 }
 
-func testEmailTask() EmailTask {
-	return EmailTask{TargetGroup: "it", RecipientAddrs: []*mail.Address{{Address: "admin@example.com"}},
-		Subject: "test", Content: "body\n.next", MessageID: "stable-test@gomail-api", CreatedAt: time.Unix(1700000000, 0)}
+func testEmailTask() *task {
+	return &task{Group: "it", Recipients: []*mail.Address{{Address: "admin@example.com"}},
+		Subject: "test", Body: "body\n.next", ID: "stable-test@gomail-api", CreatedAt: time.Unix(1700000000, 0)}
+}
+
+func testMailer(t *testing.T, primary SMTPConfig, backup *SMTPConfig) *mailer {
+	t.Helper()
+	m, err := newMailer(&settings{primary: primary, backup: backup, sendTimeout: DefaultSendTimeout}, &cooldown{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.closeConns)
+	return m
 }
 
 func waitSMTPCommand(t *testing.T, server *testSMTP, command string) {
@@ -176,7 +185,7 @@ func TestSMTPCancellation(t *testing.T) {
 	for mode, stage := range map[string]string{"silent_greeting": "connect", "silent_helo": "EHLO", "silent_data": "DATA"} {
 		t.Run(mode, func(t *testing.T) {
 			server := startTestSMTP(t, mode)
-			sender, err := newSMTPSender(server.config)
+			sender, err := newSMTPSender("test", server.config)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -204,7 +213,7 @@ func TestSMTPCancellation(t *testing.T) {
 
 func TestSMTPHandshakeDeadline(t *testing.T) {
 	server := startTestSMTP(t, "silent_greeting")
-	sender, err := newSMTPSender(server.config)
+	sender, err := newSMTPSender("test", server.config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,11 +230,7 @@ func TestSMTPHandshakeDeadline(t *testing.T) {
 func TestSMTPAcceptedCleanupFailureDoesNotFailover(t *testing.T) {
 	primary := startTestSMTP(t, "reset_failure")
 	backup := startTestSMTP(t, "normal")
-	senders, err := newWorkerSenders(&runtimeConfig{raw: &Config{PrimarySMTP: primary.config, BackupSMTP: &backup.config}}, zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer senders.close()
+	senders := testMailer(t, primary.config, &backup.config)
 	if err := senders.send(context.Background(), testEmailTask()); err != nil {
 		t.Fatal(err)
 	}
@@ -237,13 +242,9 @@ func TestSMTPAcceptedCleanupFailureDoesNotFailover(t *testing.T) {
 func TestSMTPFailoverAndStableMessage(t *testing.T) {
 	primary := startTestSMTP(t, "reject_rcpt")
 	backup := startTestSMTP(t, "normal")
-	senders, err := newWorkerSenders(&runtimeConfig{raw: &Config{PrimarySMTP: primary.config, BackupSMTP: &backup.config}}, zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer senders.close()
-	task := testEmailTask()
-	if err := senders.send(context.Background(), task); err != nil {
+	senders := testMailer(t, primary.config, &backup.config)
+	item := testEmailTask()
+	if err := senders.send(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
 	if primary.delivered.Load() != 0 || backup.delivered.Load() != 1 {
@@ -253,18 +254,18 @@ func TestSMTPFailoverAndStableMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Header.Get("Message-ID") != "<"+task.MessageID+">" {
+	if parsed.Header.Get("Message-ID") != "<"+item.ID+">" {
 		t.Fatal("message identity changed")
 	}
 	date, err := parsed.Header.Date()
-	if err != nil || !date.Equal(task.CreatedAt) {
+	if err != nil || !date.Equal(item.CreatedAt) {
 		t.Fatal("message date changed")
 	}
 }
 
 func TestSMTPHandshakeFailureClosesTransport(t *testing.T) {
 	server := startTestSMTP(t, "reject_helo")
-	sender, err := newSMTPSender(server.config)
+	sender, err := newSMTPSender("test", server.config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +292,7 @@ func TestSMTPTLSAndAuthentication(t *testing.T) {
 			cfg.Email = "告警机器人 <robot@example.com>"
 			cfg.Password = "test-smtp-password"
 			cfg.SkipVerify = true // 模拟内网 SMTP 的自签名证书。
-			sender, err := newSMTPSender(cfg)
+			sender, err := newSMTPSender("test", cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -326,12 +327,12 @@ func TestSMTPTLSAndAuthentication(t *testing.T) {
 func TestSMTPStalledConnectionLeavesTimeForBackup(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := SMTPConfig{Server: "smtp.example.com", Port: 25, Email: "robot@example.com"}
-		primary, err := newSMTPSender(cfg)
+		primary, err := newSMTPSender("test", cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer primary.close()
-		backup, err := newSMTPSender(cfg)
+		backup, err := newSMTPSender("test", cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -356,15 +357,46 @@ func TestSMTPStalledConnectionLeavesTimeForBackup(t *testing.T) {
 		if err := primary.send(context.Background(), testEmailTask()); err != nil {
 			t.Fatal(err)
 		}
-		senders := &workerSenders{primary: primary, backup: backup, logger: zap.NewNop()}
-		ctx, cancel := context.WithTimeout(context.Background(), SendTimeout)
+		senders := &mailer{primary: primary, backup: backup, primaryDown: &cooldown{}, logger: slog.New(slog.DiscardHandler)}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*DefaultSendTimeout)
 		defer cancel()
 		started := time.Now()
 		if err := senders.send(ctx, testEmailTask()); err != nil {
 			t.Fatal(err)
 		}
-		if time.Since(started) != SMTPTimeout || backupDeliveries != 1 || primaryDials != 1 {
+		// 探测超时后重建一次主连接，新连接仍挂起，直到主 SMTP 预算耗尽后切换备用。
+		if time.Since(started) != DefaultSendTimeout || backupDeliveries != 1 || primaryDials != 2 {
 			t.Fatalf("elapsed=%v backup=%d primary dials=%d", time.Since(started), backupDeliveries, primaryDials)
+		}
+	})
+}
+
+// 空闲连接被静默丢弃时，探测在短超时内失败并重建连接，仍由主 SMTP 完成投递。
+func TestSMTPStaleConnectionReconnectsAfterProbeTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		primary, err := newSMTPSender("test", SMTPConfig{Server: "smtp.example.com", Port: 25, Email: "robot@example.com"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer primary.close()
+		var dials, deliveries int
+		primary.dial = func(context.Context, string, string) (net.Conn, error) {
+			dials++
+			client, server := net.Pipe()
+			go serveTestPipe(server, dials == 1, func() { deliveries++ })
+			return client, nil
+		}
+		if err := primary.send(context.Background(), testEmailTask()); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), DefaultSendTimeout)
+		defer cancel()
+		started := time.Now()
+		if err := primary.send(ctx, testEmailTask()); err != nil {
+			t.Fatal(err)
+		}
+		if time.Since(started) != SMTPProbeTimeout || dials != 2 || deliveries != 2 {
+			t.Fatalf("elapsed=%v dials=%d deliveries=%d", time.Since(started), dials, deliveries)
 		}
 	})
 }
@@ -404,6 +436,131 @@ func serveTestPipe(conn net.Conn, stallAfterReset bool, onMessage func()) {
 			fmt.Fprint(conn, "250 OK\r\n")
 		default:
 			fmt.Fprint(conn, "250 OK\r\n")
+		}
+	}
+}
+
+func TestSMTPConnectionReuse(t *testing.T) {
+	server := startTestSMTP(t, "normal")
+	sender, err := newSMTPSender("test", server.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sender.send(ctx, testEmailTask()); err != nil {
+		t.Fatal(err)
+	}
+	original := sender.conn
+	// 过期 deadline 不应导致健康连接被丢弃。
+	if err := original.UpdateDeadline(-time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.send(ctx, testEmailTask()); err != nil {
+		t.Fatalf("send after expired deadline: %v", err)
+	}
+	if sender.conn != original {
+		t.Fatal("healthy connection was not reused")
+	}
+	// 本地关闭底层连接，模拟服务器断开。
+	_ = original.Text.Close()
+	if err := sender.send(ctx, testEmailTask()); err != nil {
+		t.Fatalf("send after disconnect: %v", err)
+	}
+	if sender.conn == original || server.delivered.Load() != 3 {
+		t.Fatal("stale connection was not replaced")
+	}
+}
+
+// 主 SMTP 失败后进入冷却，后续任务先走备用；冷却结束后恢复主 SMTP 优先。
+func TestPrimaryCooldownPrefersBackup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := SMTPConfig{Server: "smtp.example.com", Port: 25, Email: "robot@example.com"}
+		var primaryDials, primaryDeliveries, backupDeliveries int
+		primaryUp := false
+		m := testMailer(t, cfg, &cfg)
+		m.primary.dial = func(context.Context, string, string) (net.Conn, error) {
+			primaryDials++
+			if !primaryUp {
+				return nil, errors.New("connection refused")
+			}
+			client, server := net.Pipe()
+			go serveTestPipe(server, false, func() { primaryDeliveries++ })
+			return client, nil
+		}
+		m.backup.dial = func(context.Context, string, string) (net.Conn, error) {
+			client, server := net.Pipe()
+			go serveTestPipe(server, false, func() { backupDeliveries++ })
+			return client, nil
+		}
+		for range 3 {
+			if err := m.send(context.Background(), testEmailTask()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if primaryDials != 1 || backupDeliveries != 3 || !m.primaryDown.active() {
+			t.Fatalf("primary dials=%d backup=%d", primaryDials, backupDeliveries)
+		}
+		primaryUp = true
+		time.Sleep(PrimaryCooldown)
+		if err := m.send(context.Background(), testEmailTask()); err != nil {
+			t.Fatal(err)
+		}
+		if primaryDeliveries != 1 || backupDeliveries != 3 || m.primaryDown.active() {
+			t.Fatalf("primary=%d backup=%d", primaryDeliveries, backupDeliveries)
+		}
+	})
+}
+
+func TestBuildMessageDisplayNames(t *testing.T) {
+	for _, named := range []bool{false, true} {
+		from := "robot@example.com"
+		rcpt := &mail.Address{Address: "admin@example.com"}
+		if named {
+			from = "告警机器人 <robot@example.com>"
+			rcpt.Name = "运维"
+		}
+		msg, err := buildMessage(from, &task{Recipients: []*mail.Address{rcpt}, Subject: "告警", Body: "测试"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf strings.Builder
+		if _, err := msg.WriteTo(&buf); err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := mail.ReadMessage(strings.NewReader(buf.String()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for header, want := range map[string][2]string{
+			"From": {"robot@example.com", "告警机器人"}, "To": {"admin@example.com", "运维"},
+		} {
+			addr, err := mail.ParseAddress(parsed.Header.Get(header))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantName := want[0]
+			if named {
+				wantName = want[1]
+			}
+			if addr.Address != want[0] || addr.Name != wantName {
+				t.Fatalf("%s = %+v", header, addr)
+			}
+		}
+		if !named && rcpt.Name != "" {
+			t.Fatal("shared recipient was modified")
+		}
+	}
+	if _, err := buildMessage("robot@example.com", &task{Subject: "x", Body: "y"}); err == nil {
+		t.Fatal("message without recipients accepted")
+	}
+}
+
+func TestNormalizeBody(t *testing.T) {
+	for input, want := range map[string]string{"": "", "a": "a", "a\nb\rc\r\nd": "a\r\nb\r\nc\r\nd", "\r\r\n": "\r\n\r\n"} {
+		if got := normalizeBody(input); got != want {
+			t.Fatalf("normalizeBody(%q) = %q, want %q", input, got, want)
 		}
 	}
 }

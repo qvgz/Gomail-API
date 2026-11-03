@@ -1,66 +1,50 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"net/mail"
+	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
-
-	"go.uber.org/zap"
 )
 
 const (
 	MaxHeaderLength = 1024
-	MaxBodyLength   = 1024 * 512
-	PidFileName     = "/tmp/gomail-api.pid"
-	SMTPTimeout     = 30 * time.Second
-	RetryInterval   = 3 * time.Second
-	MaxSendRetries  = 5
-	SendTimeout     = 60 * time.Second
-	ShutdownTimeout = 30 * time.Second
-)
+	MaxBodyLength   = 512 * 1024
 
-type EmailTask struct {
-	TargetGroup    string
-	RecipientAddrs []*mail.Address
-	Subject        string
-	Content        string
-	MessageID      string
-	CreatedAt      time.Time
-}
+	DefaultSendTimeout = 10 * time.Second // 单个 SMTP 服务器一次投递的默认上限，含拨号、握手、认证、发送
+	SMTPProbeTimeout   = 5 * time.Second  // 复用连接前 NOOP 探测的上限
+	SMTPIdleTimeout    = 60 * time.Second // worker 空闲超过该时长主动关闭连接
+	PrimaryCooldown    = 60 * time.Second // 主 SMTP 失败后优先使用备用的时长
+
+	ShutdownTimeout = 30 * time.Second
+	CheckTimeout    = 10 * time.Second
+)
 
 var Version = "dev"
 
 func main() {
 	configPath := flag.String("config", "config.json", "配置文件路径")
-	checkMode := flag.Bool("check", false, "验证配置并测试连接")
-	reloadMode := flag.Bool("reload", false, "向运行中的服务发送重载信号")
-	versionMode := flag.Bool("version", false, "查看版本")
+	checkMode := flag.Bool("check", false, "验证配置并测试 SMTP 连接，不发送邮件")
+	versionMode := flag.Bool("version", false, "输出版本")
 	flag.Parse()
 
 	if *versionMode {
 		fmt.Println(Version)
-		os.Exit(0)
+		return
 	}
 
-	if *reloadMode {
-		if err := performReload(); err != nil {
-			fmt.Fprintf(os.Stderr, "重载失败: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("重载信号已发送。")
-		os.Exit(0)
-	}
-
-	cfg, err := loadAndValidateConfig(*configPath)
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "配置加载失败: %v\n", err)
 		os.Exit(1)
 	}
 
 	if *checkMode {
-		if err := runDeepCheck(cfg); err != nil {
+		if err := checkSMTP(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "[FAIL] %v\n", err)
 			os.Exit(1)
 		}
@@ -68,8 +52,11 @@ func main() {
 		return
 	}
 
-	app := newApp(cfg, *configPath)
-	if err := app.run(); err != nil {
-		app.logger.Fatal("server exited with error", zap.Error(err))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, cfg, logger); err != nil {
+		logger.Error("server exited with error", "error", err)
+		os.Exit(1)
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,9 +9,9 @@ import (
 	"net"
 	"net/mail"
 	"os"
-	"runtime"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type SMTPConfig struct {
@@ -21,34 +22,39 @@ type SMTPConfig struct {
 	SkipVerify bool   `json:"skip_verify"`
 }
 
+// 数值字段缺省时使用默认值；显式给出的值按字面生效（如 0 表示不限速、不重试）。
 type Config struct {
+	HTTPPort          *int                `json:"http_port,omitempty"`
 	PrimarySMTP       SMTPConfig          `json:"primary_smtp"`
 	BackupSMTP        *SMTPConfig         `json:"backup_smtp"`
 	RecipientGroups   map[string][]string `json:"recipient_groups"`
-	RateLimitInterval int                 `json:"rate_limit_interval"`
-	QueueCapacity     int                 `json:"queue_capacity"`
-	WorkerCount       int                 `json:"worker_count"`
-	HTTPPort          int                 `json:"http_port"`
+	RateLimitInterval *int                `json:"rate_limit_interval,omitempty"`
+	MaxRetries        *int                `json:"max_retries,omitempty"`
+	SendTimeout       *int                `json:"send_timeout,omitempty"`
+	QueueCapacity     *int                `json:"queue_capacity,omitempty"`
+	WorkerCount       *int                `json:"worker_count,omitempty"`
 }
 
-type recipientGroup struct {
-	parsed []*mail.Address
+// settings 是校验并补齐默认值后的只读配置。
+type settings struct {
+	httpPort      int
+	primary       SMTPConfig
+	backup        *SMTPConfig
+	groups        map[string][]*mail.Address
+	sendInterval  time.Duration
+	sendTimeout   time.Duration
+	maxRetries    int
+	queueCapacity int
+	workers       int
 }
 
-type runtimeConfig struct {
-	raw       *Config
-	groups    map[string]recipientGroup
-	rateLimit time.Duration
-}
-
-func loadAndValidateConfig(path string) (*runtimeConfig, error) {
+func loadConfig(path string) (*settings, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-
 	var cfg Config
-	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, err
@@ -56,149 +62,138 @@ func loadAndValidateConfig(path string) (*runtimeConfig, error) {
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return nil, errors.New("config must contain a single JSON object")
 	}
-	// 在 JSON 解码后展开字符串，避免环境变量中的引号、反斜杠破坏 JSON。
-	expand := func(value *string) error {
-		var missing string
-		*value = os.Expand(*value, func(name string) string {
-			v, ok := os.LookupEnv(name)
-			if !ok {
-				missing = name
-			}
-			return v
-		})
-		if missing != "" {
-			return fmt.Errorf("config references unset environment variable %q", missing)
-		}
-		return nil
-	}
-	expandSMTP := func(sc *SMTPConfig) error {
-		for _, value := range []*string{&sc.Server, &sc.Email, &sc.Password} {
-			if err := expand(value); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if err := expandSMTP(&cfg.PrimarySMTP); err != nil {
-		return nil, err
-	}
+	// 解码后再展开环境变量，变量值中的引号、反斜杠不会破坏 JSON。
+	fields := []*string{&cfg.PrimarySMTP.Server, &cfg.PrimarySMTP.Email, &cfg.PrimarySMTP.Password}
 	if cfg.BackupSMTP != nil {
-		if err := expandSMTP(cfg.BackupSMTP); err != nil {
-			return nil, err
-		}
+		fields = append(fields, &cfg.BackupSMTP.Server, &cfg.BackupSMTP.Email, &cfg.BackupSMTP.Password)
 	}
 	for _, recipients := range cfg.RecipientGroups {
 		for i := range recipients {
-			if err := expand(&recipients[i]); err != nil {
-				return nil, err
-			}
+			fields = append(fields, &recipients[i])
 		}
 	}
-
-	return buildRuntimeConfig(&cfg)
-}
-
-func buildRuntimeConfig(cfg *Config) (*runtimeConfig, error) {
-	if cfg == nil {
-		return nil, errors.New("config is nil")
-	}
-	// 保存独立副本，运行配置发布后不再修改。
-	copy := *cfg
-	cfg = &copy
-	if err := validateSMTP("primary_smtp", cfg.PrimarySMTP); err != nil {
-		return nil, err
-	}
-	if cfg.BackupSMTP != nil {
-		backup := *cfg.BackupSMTP
-		cfg.BackupSMTP = &backup
-		if err := validateSMTP("backup_smtp", backup); err != nil {
+	for _, field := range fields {
+		if err := expandEnv(field); err != nil {
 			return nil, err
 		}
 	}
-	if cfg.HTTPPort < 0 || cfg.HTTPPort > 65535 {
-		return nil, errors.New("http_port must be between 0 and 65535")
+	return newSettings(cfg)
+}
+
+func expandEnv(value *string) error {
+	var missing string
+	*value = os.Expand(*value, func(name string) string {
+		v, ok := os.LookupEnv(name)
+		if !ok && missing == "" {
+			missing = name
+		}
+		return v
+	})
+	if missing != "" {
+		return fmt.Errorf("config references unset environment variable %q", missing)
 	}
-	if cfg.QueueCapacity < 0 || cfg.QueueCapacity > 100000 {
-		return nil, errors.New("queue_capacity must be between 0 and 100000")
+	return nil
+}
+
+func newSettings(cfg Config) (*settings, error) {
+	if err := validateSMTP("primary_smtp", cfg.PrimarySMTP); err != nil {
+		return nil, err
 	}
-	if cfg.WorkerCount < 0 || cfg.WorkerCount > 1024 {
-		return nil, errors.New("worker_count must be between 0 and 1024")
+	s := &settings{primary: cfg.PrimarySMTP}
+	if cfg.BackupSMTP != nil {
+		if err := validateSMTP("backup_smtp", *cfg.BackupSMTP); err != nil {
+			return nil, err
+		}
+		backup := *cfg.BackupSMTP
+		s.backup = &backup
 	}
-	if cfg.RateLimitInterval < 0 || cfg.RateLimitInterval > 86400 {
-		return nil, errors.New("rate_limit_interval must be between 0 and 86400 seconds")
+
+	var rateLimit, sendTimeout int
+	ints := []struct {
+		name               string
+		value              *int
+		target             *int
+		min, max, fallback int
+	}{
+		{"http_port", cfg.HTTPPort, &s.httpPort, 1, 65535, 8080},
+		{"rate_limit_interval", cfg.RateLimitInterval, &rateLimit, 0, 86400, 1},
+		{"max_retries", cfg.MaxRetries, &s.maxRetries, 0, 10, 2},
+		{"send_timeout", cfg.SendTimeout, &sendTimeout, 1, 300, int(DefaultSendTimeout / time.Second)},
+		{"queue_capacity", cfg.QueueCapacity, &s.queueCapacity, 1, 100000, 1000},
+		{"worker_count", cfg.WorkerCount, &s.workers, 1, 64, 4},
 	}
-	if cfg.HTTPPort == 0 {
-		cfg.HTTPPort = 8080
+	for _, field := range ints {
+		*field.target = field.fallback
+		if field.value == nil {
+			continue
+		}
+		if *field.value < field.min || *field.value > field.max {
+			return nil, fmt.Errorf("%s must be between %d and %d", field.name, field.min, field.max)
+		}
+		*field.target = *field.value
 	}
-	if cfg.QueueCapacity == 0 {
-		cfg.QueueCapacity = 1000
-	}
-	if cfg.WorkerCount == 0 {
-		cfg.WorkerCount = min(runtime.NumCPU()*2, 1024)
-	}
+	s.sendInterval = time.Duration(rateLimit) * time.Second
+	s.sendTimeout = time.Duration(sendTimeout) * time.Second
 
 	if len(cfg.RecipientGroups) == 0 {
 		return nil, errors.New("recipient_groups is empty")
 	}
-
-	groups := make(map[string]recipientGroup, len(cfg.RecipientGroups))
-	rawGroups := make(map[string][]string, len(cfg.RecipientGroups))
+	s.groups = make(map[string][]*mail.Address, len(cfg.RecipientGroups))
 	for name, recipients := range cfg.RecipientGroups {
-		if strings.TrimSpace(name) == "" || len(name) > MaxHeaderLength || sanitizeHeader(name) != name {
+		if strings.TrimSpace(name) == "" || len(name) > MaxHeaderLength || hasControl(name) {
 			return nil, errors.New("recipient group name is empty, too long or contains control characters")
 		}
-		if len(recipients) == 0 {
-			return nil, fmt.Errorf("recipient_groups.%s is empty", name)
+		parsed, err := parseRecipients(recipients)
+		if err != nil {
+			return nil, fmt.Errorf("recipient_groups.%s: %w", name, err)
 		}
-
-		parsed := make([]*mail.Address, 0, len(recipients))
-		seen := make(map[string]bool, len(recipients))
-		for _, rcpt := range recipients {
-			if sanitizeHeader(rcpt) != rcpt {
-				return nil, fmt.Errorf("recipient_groups.%s has control characters in address", name)
-			}
-			addr := strings.TrimSpace(rcpt)
-			if addr == "" {
-				return nil, fmt.Errorf("recipient_groups.%s has empty address", name)
-			}
-
-			parsedAddr, err := mail.ParseAddress(addr)
-			if err != nil {
-				return nil, fmt.Errorf("recipient_groups.%s has invalid address %q: %w", name, addr, err)
-			}
-			if !seen[parsedAddr.Address] {
-				parsed = append(parsed, parsedAddr)
-				seen[parsedAddr.Address] = true
-			}
-		}
-
-		groups[name] = recipientGroup{parsed: parsed}
-		rawGroups[name] = append([]string(nil), recipients...)
+		s.groups[name] = parsed
 	}
-	cfg.RecipientGroups = rawGroups
-
-	return &runtimeConfig{
-		raw:       cfg,
-		groups:    groups,
-		rateLimit: time.Duration(cfg.RateLimitInterval) * time.Second,
-	}, nil
+	return s, nil
 }
 
-func validateSMTP(name string, cfg SMTPConfig) error {
-	if cfg.Server == "" || strings.ContainsAny(cfg.Server, " /\\\t\r\n") || sanitizeHeader(cfg.Server) != cfg.Server {
+// parseRecipients 校验地址并按实际邮箱去重，保留首次出现的显示名。
+func parseRecipients(recipients []string) ([]*mail.Address, error) {
+	if len(recipients) == 0 {
+		return nil, errors.New("group is empty")
+	}
+	parsed := make([]*mail.Address, 0, len(recipients))
+	seen := make(map[string]bool, len(recipients))
+	for _, rcpt := range recipients {
+		if hasControl(rcpt) {
+			return nil, errors.New("address contains control characters")
+		}
+		addr, err := mail.ParseAddress(strings.TrimSpace(rcpt))
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %q: %w", rcpt, err)
+		}
+		if !seen[addr.Address] {
+			seen[addr.Address] = true
+			parsed = append(parsed, addr)
+		}
+	}
+	return parsed, nil
+}
+
+func validateSMTP(name string, sc SMTPConfig) error {
+	if sc.Server == "" || strings.ContainsAny(sc.Server, " /\\") || hasControl(sc.Server) {
 		return fmt.Errorf("invalid %s.server: expected hostname or IP address", name)
 	}
-	if strings.Contains(cfg.Server, ":") && net.ParseIP(cfg.Server) == nil {
+	if strings.Contains(sc.Server, ":") && net.ParseIP(sc.Server) == nil {
 		return fmt.Errorf("invalid %s.server: specify the port in the port field", name)
 	}
-	if cfg.Port <= 0 || cfg.Port > 65535 {
+	if sc.Port <= 0 || sc.Port > 65535 {
 		return fmt.Errorf("invalid %s.port", name)
 	}
-	if sanitizeHeader(cfg.Email) != cfg.Email {
+	if hasControl(sc.Email) {
 		return fmt.Errorf("invalid %s.email: control characters", name)
 	}
-	if _, err := mail.ParseAddress(cfg.Email); err != nil {
+	if _, err := mail.ParseAddress(sc.Email); err != nil {
 		return fmt.Errorf("invalid %s.email", name)
 	}
 	return nil
+}
+
+func hasControl(v string) bool {
+	return strings.IndexFunc(v, unicode.IsControl) >= 0
 }

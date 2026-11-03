@@ -24,6 +24,8 @@
     ]
   },
   "rate_limit_interval": 1,
+  "max_retries": 2,
+  "send_timeout": 10,
   "queue_capacity": 2000,
   "worker_count": 5
 }

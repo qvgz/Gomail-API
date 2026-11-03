@@ -1,12 +1,12 @@
 # gomail-api
 
-Go SMTP 中继 API，支持有界邮件队列、工作池、主备 SMTP、连接复用、失败重试和配置热重载。
+Go SMTP 中继 API：有界内存队列、工作池、主备 SMTP、连接复用、指数退避重试。
 
-面向内网部署，网关负责访问及请求校验；本服务负责接收邮件任务并通过 SMTP 发送。
+面向内网部署，网关负责访问控制；本服务接收邮件任务并通过 SMTP 发送。
 
 ## 运行
 
-配置示例见 `config-example.json`，生产配置默认为 `/app/config.json`。
+配置示例见 `config-example.json`，容器内默认路径为 `/app/config.json`。
 
 ```json
 {
@@ -22,9 +22,11 @@ Go SMTP 中继 API，支持有界邮件队列、工作池、主备 SMTP、连接
   "recipient_groups": {
     "it": ["admin@yourdomain.com"]
   },
-  "rate_limit_interval": 10,
-  "queue_capacity": 2000,
-  "worker_count": 5
+  "rate_limit_interval": 1,
+  "max_retries": 2,
+  "send_timeout": 10,
+  "queue_capacity": 1000,
+  "worker_count": 4
 }
 ```
 
@@ -42,98 +44,70 @@ curl --data-urlencode 'target_group=it' \
   http://127.0.0.1:8080/
 ```
 
-环境变量在 JSON 解码后展开，变量值中的引号和反斜杠不会破坏配置。
-支持 `$VAR` 和 `${VAR}`，未定义的变量会导致配置检查失败。
-变量值不会再次展开；包含 `$` 的字面密码应通过环境变量提供。
-配置仅接受一个 JSON 对象，未知字段、非法地址和越界参数会被拒绝。
-
 | 参数 | 默认值 | 范围/含义 |
 | --- | --- | --- |
-| `http_port` | 8080 | 1–65535；0 使用默认值 |
-| `queue_capacity` | 1000 | 1–100000；0 使用默认值；按内存预算设置 |
-| `worker_count` | CPU 数量 × 2，上限 1024 | 1–1024；0 使用默认值 |
-| `rate_limit_interval` | 0 | 0–86400 秒；每个 worker 的任务启动间隔，0 不限制 |
-| `backup_smtp` | 无 | 主 SMTP 失败时使用备用服务器 |
+| `http_port` | 8080 | 1–65535 |
+| `queue_capacity` | 1000 | 1–100000；排队、发送中、等待重试的任务总数上限 |
+| `worker_count` | 4 | 1–64；并发 SMTP 连接数（主、备各一条/worker） |
+| `rate_limit_interval` | 1 | 0–86400 秒；全局发送尝试最小间隔（含重试），0 不限制 |
+| `max_retries` | 2 | 0–10；首次失败后的最大重试次数，0 不重试 |
+| `send_timeout` | 10 | 1–300 秒；单个 SMTP 服务器单次投递超时，含拨号、握手、认证、发送 |
+| `backup_smtp` | 无 | 备用服务器 |
 
-多个 worker 可以并行发送，因此 `rate_limit_interval` 不是全局发送限速。
-重试采用独立的 3 秒间隔。SMTP 服务器的连接数和发送配额应与 worker 数量匹配。
-同组重复的实际收件地址会去重，已有显示名保留；无显示名时使用邮箱地址，避免部分客户端直接显示开头的 `<`。
+数值参数缺省时使用默认值，显式给出的值按字面生效。配置只接受单个 JSON 对象，未知字段、非法地址、越界参数会被拒绝。
+字符串中的 `$VAR`、`${VAR}` 在 JSON 解码后展开，未定义变量视为错误；含 `$` 的字面密码应通过环境变量提供。
+修改配置需重启进程。收件组内重复地址会去重；无显示名的地址以邮箱作为显示名。
 
 ## 接口
 
-- `POST /`（兼容其他 POST 路径）：表单参数 `target_group`、`subject`、`content` 必填。
-  返回 `200 queued` 表示邮件已进入内存队列，响应头 `X-Message-ID` 可关联投递日志。
-- `GET /healthz`：进程存活检查。
-- `GET /readyz`：配置已加载且未进入退出流程时返回 200；不检测外部 SMTP 的可达性。
-- `GET /status`：运行时长、队列、进程和投递统计。
+- `POST /`：表单（urlencoded 或 multipart）字段 `target_group`、`subject`、`content` 必填。
+  返回 `200 queued`，响应头 `X-Message-ID` 可关联日志。
+  请求体超限或编码非法、缺参、主题含控制字符或超长返回 400；组不存在 404；队列满或正在退出 503。
+- `GET /healthz`：进程存活。
+- `GET /readyz`：未进入退出流程时返回 200；不检测 SMTP 可达性。
+- `GET /status`：队列（`pending`、`ready`、`retry_waiting`、`in_flight`、`capacity`）与累计投递计数（`accepted`、`sent`、`failed`、`retries`、`discarded`）。
 
-请求体最大 512 KiB（包括表单编码），主题和组名最长 1024 字节。
-主题包含控制字符或只有空白时返回 400；不存在的收件组返回 404；队列满或正在退出返回 503。
-HTTP 请求头最大约 32 KiB，设有请求头、读取、写入和空闲连接超时。
+请求体最大 512 KiB，主题和组名最长 1024 字节。
 
-`/status` 的 `delivery` 字段包含 `accepted`、`sent`、`failed`、`retries`、`discarded`、`in_flight`。
-计数自进程启动累计：`sent` 表示 SMTP 已确认接收，`failed` 表示任务最终失败，
-`discarded` 表示退出超时后未处理的排队任务，`in_flight` 包括限速/重试等待中的任务。
-运行中的统计为并发快照，不是事务快照。
+## 投递
 
-## 投递与退出
+- 每次尝试先主后备，各有 `send_timeout` 预算；默认配置下单次尝试最长 20 秒，小于 30 秒退出期限。
+- 主 SMTP 失败后 60 秒内所有 worker 优先使用备用 SMTP，仍会回退尝试主 SMTP；主 SMTP 成功即解除。
+- 失败后间隔 `rate_limit_interval` 重试，最多 `max_retries` 次，仍未成功记为 `failed`。
+  等待重试的任务不占用 worker，但占用队列容量；队列满时返回 503。
+- 连接复用：复用前 5 秒 NOOP 探测，失效即重建；worker 空闲 60 秒主动断开。
+- 重试和切换服务器时 `Message-ID` 与 `Date` 不变。DATA 已获确认后的清理失败不会重投。
+- 日志为 JSON（stdout），记录 `mail queued`、`send failed, retrying`、`send success`、`send failed`，以 `message_id` 关联，不采样。
 
-发送失败后等待 **3 秒**，最多重试 **5 次**，含首次共 6 次尝试。
-每次尝试先使用主 SMTP，失败后尝试备用 SMTP（若配置且本次超时尚未耗尽）。
-每次尝试共用独立的 60 秒上限；主、备 SMTP 各自最多使用 30 秒，包含连接探测、拨号、握手和发送。
-握手、认证、探测和正文发送都响应取消，失败连接及时关闭。
+## 退出
 
-SMTP 连接复用前刷新超时并探测，失效连接自动重建。
-同一任务重试或切换 SMTP 时保留 `Message-ID` 和邮件日期，便于追踪。
-SMTP 已确认收信后的 `RSET` 失败只清理连接，不再次投递。
-重试日志记录次数和间隔，最终记录 `send success` 或 `send failed`，通过 `message_id` 关联。
-日志不采样，便于统计每一次投递结果。
+收到 SIGTERM/SIGINT 后拒绝新任务、关闭 HTTP 监听，继续投递（含重试）直到队列清空。
+HTTP 关闭与排空共用 **30 秒**期限；超时则取消发送，未完成任务计入 `discarded` 并以非零状态退出。
+容器停止期限应大于 30 秒（示例为 40 秒）。
 
-收到 SIGTERM/SIGINT 后拒绝新任务、关闭 HTTP 监听并处理已入队任务。
-HTTP 关闭和队列排空共用 **30 秒**期限；超时则取消正在进行的发送与等待，记录未处理队列数量并以错误退出。
-容器停止期限应大于 30 秒，例如示例中的 40 秒。
+## 可靠性边界
 
-## 配置重载与命令
+队列在内存中：进程崩溃、SIGKILL、OOM、退出超时会丢失未完成任务。需要持久化与死信重放时，应在前面接入持久消息队列。
+SMTP 接收后、确认前断线无法判断是否已投递，重试可能产生重复邮件；本服务优先不丢件，不保证恰好一次。
+
+465 使用隐式 TLS，587 强制 STARTTLS，其他端口机会式 STARTTLS。
+建议监控 `failed`、`retries`、`queue.pending`、进程重启和 SMTP 配额。
+
+## 命令
 
 ```text
 gomail-api
-  -check          验证配置并测试主备 SMTP 连接，不发送邮件
-  -config PATH    指定配置路径，默认 config.json
-  -reload         向运行实例发送 SIGHUP
+  -check          验证配置并测试主备 SMTP 连接（各 10 秒超时），不发送邮件
+  -config PATH    配置路径，默认 config.json
   -version        输出版本
 ```
 
-`-check` 的主备连接检查共用 10 秒超时。
-重载 SMTP、收件组和发送间隔时整体校验后原子替换；失败继续使用旧配置。
-`http_port`、`queue_capacity`、`worker_count` 变更需要重启，热重载会拒绝整份配置，避免部分生效。
-已入队任务保留入队时的收件人，在任务开始时使用当前 SMTP 配置。
-
-PID 文件 `/tmp/gomail-api.pid` 使用进程锁防止重复实例覆盖，退出后保留文件并释放锁。
-`-reload` 会检查锁状态，拒绝根据已退出进程留下的 PID 文件发送信号。
-同一文件系统命名空间中仅允许一个实例；多副本应使用独立容器。
-
-## 生产边界
-
-当前队列保存在内存中。`queued` 不代表持久化或最终送达：崩溃、SIGKILL、节点故障和退出超时都可能丢失未完成任务。
-需要崩溃恢复、投递审计和死信重放时，应在前面接入持久消息队列，或另行实现可靠的持久化任务存储。
-重试耗尽的任务当前只记录日志和失败计数，不保存到死信队列。
-
-SMTP 在接收邮件后、返回确认前断线时无法确定是否已投递，重试仍可能重复。
-固定 `Message-ID` 便于追踪，不能保证收件服务器去重；本服务不承诺恰好一次投递，也不保证邮件已进入收件箱。
-
-465 使用隐式 TLS，587 强制 STARTTLS，其他端口使用机会式 STARTTLS；`skip_verify` 按 SMTP 服务器证书情况配置。
-监控失败/重试计数、队列占用、进程重启和 SMTP 配额；容量须结合实际峰值、内存及 SMTP 吞吐压测。
-
 ## 开发验证
 
-使用 `go.mod` 指定的 Go 版本，从包构建（拆分文件后不再使用 `go build main.go`）：
-
 ```bash
-go test -race -timeout 60s ./...
+go test -race -timeout 120s ./...
 go vet ./...
 go build -trimpath -o /tmp/gomail-api .
 ```
 
-测试使用本机模拟 SMTP，无需生产凭据，不发送真实邮件。
-Go 最低版本为 1.27.2，依赖版本以 `go.mod` 为准。
-GitHub Actions 仅保留 Linux amd64/arm64 镜像构建和发布流程，不运行额外的 CI 检查或安全扫描。
+测试使用本机模拟 SMTP 与虚拟时间（`testing/synctest`），不发送真实邮件。Go 版本以 `go.mod` 为准。
