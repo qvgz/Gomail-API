@@ -222,7 +222,7 @@ func TestSMTPHandshakeDeadline(t *testing.T) {
 	defer cancel()
 	started := time.Now()
 	err = sender.send(ctx, testEmailTask())
-	if err == nil || time.Since(started) > 2*time.Second {
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.HasPrefix(err.Error(), "connect: ") || time.Since(started) > 2*time.Second {
 		t.Fatalf("deadline not enforced: %v", err)
 	}
 }
@@ -562,5 +562,28 @@ func TestNormalizeBody(t *testing.T) {
 		if got := normalizeBody(input); got != want {
 			t.Fatalf("normalizeBody(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestCheckSMTPSendsThroughEachServer(t *testing.T) {
+	primary := startTestSMTP(t, "normal")
+	backup := startTestSMTP(t, "reject_rcpt")
+	cfg := testSettings(t, func(c *Config) { c.PrimarySMTP = primary.config; c.BackupSMTP = &backup.config })
+	var out strings.Builder
+	err := checkSMTP(cfg, "it", &out)
+	if err == nil || !strings.Contains(err.Error(), "backup") || strings.Contains(err.Error(), "primary") {
+		t.Fatalf("error: %v", err)
+	}
+	// 主备各自独立发送，备用失败不影响主，也不切换。
+	if primary.delivered.Load() != 1 || backup.delivered.Load() != 0 {
+		t.Fatalf("primary=%d backup=%d", primary.delivered.Load(), backup.delivered.Load())
+	}
+	for _, want := range []string{"[PASS] primary", "[FAIL] backup", "--- SMTP log ---", "RCPT TO", "550"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, out.String())
+		}
+	}
+	if err := checkSMTP(cfg, "missing", &out); err == nil {
+		t.Fatal("unknown group accepted")
 	}
 }

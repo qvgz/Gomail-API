@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	gomail "github.com/wneessen/go-mail"
+	gomaillog "github.com/wneessen/go-mail/log"
 	gomailsmtp "github.com/wneessen/go-mail/smtp"
 )
 
@@ -109,6 +112,7 @@ type smtpSender struct {
 	conn    *gomailsmtp.Client
 	dial    gomail.DialContextFunc
 	logger  *slog.Logger
+	opts    []gomail.Option // 附加的 go-mail 选项，如 -check 的协议日志
 }
 
 func newSMTPSender(name string, sc SMTPConfig) (*smtpSender, error) {
@@ -124,7 +128,7 @@ func smtpTLSConfig(sc SMTPConfig) *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: sc.SkipVerify, ServerName: sc.Server}
 }
 
-func newSMTPClient(sc SMTPConfig, timeout time.Duration, dial gomail.DialContextFunc) (*gomail.Client, error) {
+func newSMTPClient(sc SMTPConfig, timeout time.Duration, dial gomail.DialContextFunc, extra ...gomail.Option) (*gomail.Client, error) {
 	opts := []gomail.Option{
 		gomail.WithPort(sc.Port),
 		gomail.WithTimeout(timeout),
@@ -154,7 +158,7 @@ func newSMTPClient(sc SMTPConfig, timeout time.Duration, dial gomail.DialContext
 			gomail.WithPassword(sc.Password),
 		)
 	}
-	return gomail.NewClient(sc.Server, opts...)
+	return gomail.NewClient(sc.Server, append(opts, extra...)...)
 }
 
 func (s *smtpSender) send(ctx context.Context, t *task) error {
@@ -178,10 +182,7 @@ func (s *smtpSender) send(ctx context.Context, t *task) error {
 		s.logger.Warn("message accepted, smtp cleanup failed", "message_id", t.ID, "error", err)
 		return nil
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	return err
+	return fmt.Errorf("send: %w", withCtxErr(ctx, err))
 }
 
 func (s *smtpSender) ensureConn(ctx context.Context) (*gomailsmtp.Client, error) {
@@ -225,7 +226,7 @@ func (s *smtpSender) ensureConn(ctx context.Context) (*gomailsmtp.Client, error)
 			return tls.Client(conn, smtpTLSConfig(s.config)), nil
 		}
 		return conn, nil
-	})
+	}, s.opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -239,13 +240,22 @@ func (s *smtpSender) ensureConn(ctx context.Context) (*gomailsmtp.Client, error)
 		if raw != nil {
 			_ = raw.Close()
 		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, err
+		return nil, fmt.Errorf("connect: %w", withCtxErr(ctx, err))
 	}
 	s.client, s.conn = client, conn
 	return conn, nil
+}
+
+// withCtxErr 在 ctx 已结束时返回可被 errors.Is 识别的取消/超时错误，同时保留底层错误便于排查。
+func withCtxErr(ctx context.Context, err error) error {
+	cerr := ctx.Err()
+	if cerr == nil || errors.Is(err, cerr) {
+		return err
+	}
+	if err == nil {
+		return cerr
+	}
+	return fmt.Errorf("%w (%v)", cerr, err)
 }
 
 func (s *smtpSender) close() {
@@ -320,28 +330,51 @@ func normalizeBody(body string) string {
 	return strings.ReplaceAll(body, "\n", "\r\n")
 }
 
-func checkSMTP(cfg *settings) error {
+// checkSMTP 通过主、备 SMTP（若配置）分别向收件组发送一封测试邮件，互不切换。
+// 失败时输出错误及完整 SMTP 协议日志（不含认证数据）。
+func checkSMTP(cfg *settings, group string, out io.Writer) error {
+	recipients, ok := cfg.groups[group]
+	if !ok {
+		return fmt.Errorf("recipient group %q not found", group)
+	}
 	servers := []struct {
 		name string
 		sc   *SMTPConfig
 	}{{"primary", &cfg.primary}, {"backup", cfg.backup}}
+	var errs []error
 	for _, server := range servers {
 		if server.sc == nil {
 			continue
 		}
-		if err := func() error {
+		var transcript bytes.Buffer
+		t := &task{
+			ID:         rand.Text() + "@gomail-api",
+			Group:      group,
+			Recipients: recipients,
+			Subject:    fmt.Sprintf("[gomail-api] %s SMTP 测试邮件", server.name),
+			Body: fmt.Sprintf("gomail-api %s 检查：通过 %s SMTP (%s:%d) 发送到收件组 %s。\n",
+				Version, server.name, server.sc.Server, server.sc.Port, group),
+			CreatedAt: time.Now(),
+		}
+		err := func() error {
 			sender, err := newSMTPSender(server.name, *server.sc)
 			if err != nil {
 				return err
 			}
 			defer sender.close()
-			ctx, cancel := context.WithTimeout(context.Background(), CheckTimeout)
+			sender.timeout = cfg.sendTimeout
+			sender.opts = []gomail.Option{gomail.WithDebugLog(), gomail.WithLogger(gomaillog.New(&transcript, gomaillog.LevelDebug))}
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.sendTimeout)
 			defer cancel()
-			_, err = sender.ensureConn(ctx)
-			return err
-		}(); err != nil {
-			return fmt.Errorf("%s smtp: %w", server.name, err)
+			return sender.send(ctx, t)
+		}()
+		label := fmt.Sprintf("%s smtp %s:%d", server.name, server.sc.Server, server.sc.Port)
+		if err != nil {
+			fmt.Fprintf(out, "[FAIL] %s: %v\n--- SMTP log ---\n%s--- end ---\n", label, err, transcript.String())
+			errs = append(errs, fmt.Errorf("%s: %w", label, err))
+			continue
 		}
+		fmt.Fprintf(out, "[PASS] %s: test mail sent to %q, Message-ID <%s>\n", label, group, t.ID)
 	}
-	return nil
+	return errors.Join(errs...)
 }

@@ -97,10 +97,12 @@ SMTP 接收后、确认前断线无法判断是否已投递，重试可能产生
 
 ```text
 gomail-api
-  -check          验证配置并测试主备 SMTP 连接（各 10 秒超时），不发送邮件
+  -check GROUP    通过主、备 SMTP（若配置）分别向收件组 GROUP 实际发送一封测试邮件
   -config PATH    配置路径，默认 config.json
   -version        输出版本
 ```
+
+`-check` 主备各自独立发送、互不切换，超时为 `send_timeout`；任一失败则退出码为 1，并输出错误与完整 SMTP 协议日志（不含认证数据）。
 
 ## 开发验证
 

@@ -21,14 +21,13 @@ const (
 	PrimaryCooldown    = 60 * time.Second // 主 SMTP 失败后优先使用备用的时长
 
 	ShutdownTimeout = 30 * time.Second
-	CheckTimeout    = 10 * time.Second
 )
 
 var Version = "dev"
 
 func main() {
 	configPath := flag.String("config", "config.json", "配置文件路径")
-	checkMode := flag.Bool("check", false, "验证配置并测试 SMTP 连接，不发送邮件")
+	checkGroup := flag.String("check", "", "通过主、备 SMTP 分别向指定收件组发送测试邮件，参数为 recipient_groups 中的组名")
 	versionMode := flag.Bool("version", false, "输出版本")
 	flag.Parse()
 
@@ -43,12 +42,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *checkMode {
-		if err := checkSMTP(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "[FAIL] %v\n", err)
+	if *checkGroup != "" {
+		if err := checkSMTP(cfg, *checkGroup, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "检查失败: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("[PASS] SMTP connection successful")
 		return
 	}
 
